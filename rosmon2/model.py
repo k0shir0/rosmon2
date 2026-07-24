@@ -32,7 +32,22 @@ class ProcessRecord:
     return_code: Optional[int] = None
 
 
+SELECTION_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+
+
 def selection_key(index: int) -> Optional[str]:
     """Return rosmon's a-z, A-Z, 0-9 selection key for an index."""
-    alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-    return alphabet[index] if 0 <= index < len(alphabet) else None
+    if 0 <= index < len(SELECTION_ALPHABET):
+        return SELECTION_ALPHABET[index]
+    return None
+
+
+def namespace_of(display_name: str) -> str:
+    """Return the top-level ROS namespace containing a display name."""
+    parts = [part for part in display_name.strip('/').split('/') if part]
+    return parts[0] if len(parts) > 1 else '/'
+
+
+def full_name(display_name: str) -> str:
+    """Return the absolute form of a display name, as reported over the wire."""
+    return '/' + display_name.lstrip('/')

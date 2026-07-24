@@ -1,9 +1,36 @@
 import asyncio
 
+import pytest
+
 from launch_ros.actions import Node
 
+from rosmon2.control import ControlError
 from rosmon2.model import ProcessRecord, State
 from rosmon2.supervisor import Supervisor
+
+
+class _FakeContext:
+    """Minimal launch context stand-in for the process event callbacks."""
+
+    def __init__(self):
+        self.asyncio_loop = None
+
+
+class _FakeAction:
+    """A restart action carrying the record link the supervisor sets."""
+
+    def __init__(self, record):
+        self._rosmon2_record = record
+
+
+class _StartEvent:
+    def __init__(self, action, cmd, record):
+        self.action = action
+        self.cmd = cmd
+        self.cwd = None
+        self.env = None
+        self.pid = 4321
+        self.process_name = record.display_name
 
 
 class _UnnamedNode(Node):
@@ -166,3 +193,91 @@ def test_control_wait_returns_when_target_is_already_in_state():
 
     assert result['matched'] == 1
     assert result['nodes'][0]['name'] == '/ur10e/driver'
+
+
+def test_control_wait_reports_a_target_that_never_matched():
+    supervisor = Supervisor('', [], ui=False, control=False)
+    supervisor.records.append(ProcessRecord(key=0, display_name='ur10e/driver'))
+
+    with pytest.raises(ControlError) as excinfo:
+        asyncio.run(supervisor.control_request({
+            'command': 'wait',
+            'node': '/ur10e/ghost',
+            'state': 'running',
+            'timeout': 0,
+        }))
+
+    assert 'no process ever matched' in str(excinfo.value)
+
+
+def test_on_start_does_not_overwrite_a_restart_actions_command():
+    # ExecuteProcess.execute() starts asynchronously, so ProcessStarted for a
+    # gdb (`d`) run arrives after debug() has restored record.cmd.  The command
+    # captured from launch for our own restart actions must be ignored, or the
+    # temporary gdb wrapper would stick and every later restart would run gdb.
+    supervisor = Supervisor('', [], ui=False, control=False)
+    record = ProcessRecord(key=0, display_name='driver', cmd=['/bin/echo', 'hi'])
+    supervisor.records.append(record)
+    action = _FakeAction(record)
+    supervisor._by_action[action] = record
+
+    supervisor._on_start(
+        _StartEvent(action, ['gdb', '--args', '/bin/echo', 'hi'], record),
+        _FakeContext())
+
+    assert record.cmd == ['/bin/echo', 'hi']
+    assert record.pid == 4321
+    assert record.state is State.RUNNING
+
+
+def test_debug_restores_the_original_command_after_starting_gdb(monkeypatch):
+    supervisor = Supervisor('', [], ui=False, control=False)
+    record = ProcessRecord(key=0, display_name='driver', cmd=['/bin/echo', 'hi'])
+    supervisor.records.append(record)
+    monkeypatch.setattr('rosmon2.supervisor.shutil.which',
+                        lambda name: '/usr/bin/gdb')
+    started = {}
+    monkeypatch.setattr(supervisor, 'start',
+                        lambda rec: started.setdefault('cmd', list(rec.cmd)))
+
+    supervisor.debug(record)
+
+    assert started['cmd'][:2] == ['gdb', '--args']
+    assert record.cmd == ['/bin/echo', 'hi']
+
+
+def test_emit_event_isolates_a_failing_listener():
+    supervisor = Supervisor('', [], ui=False, control=False)
+    delivered = []
+
+    def broken(_event):
+        raise RuntimeError('subscriber went away')
+
+    supervisor.add_event_listener(broken)
+    supervisor.add_event_listener(delivered.append)
+
+    event = supervisor._emit_event('control_action', action='stop')
+
+    assert delivered == [event]
+
+
+def test_close_log_releases_the_handle_and_is_idempotent(tmp_path):
+    log_path = tmp_path / 'combined.log'
+    supervisor = Supervisor('', [], ui=False, control=False, log_file=str(log_path))
+    assert supervisor._log_handle is not None
+
+    supervisor.close_log()
+    assert supervisor._log_handle is None
+    supervisor.close_log()
+
+
+def test_failed_run_still_releases_the_log_handle(tmp_path):
+    log_path = tmp_path / 'combined.log'
+    supervisor = Supervisor(
+        '/nonexistent/does_not_exist.launch.py', ['not-a-valid-arg'],
+        ui=False, control=False, log_file=str(log_path))
+
+    with pytest.raises(Exception):
+        asyncio.run(supervisor.run())
+
+    assert supervisor._log_handle is None

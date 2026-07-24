@@ -300,3 +300,49 @@ def test_start_keeps_shared_terminal_output_blocking(monkeypatch):
 
     assert blocking_calls == [(stdout.fd, True)]
     assert loop.readers == [(stdin.fd, ui._read_input)]
+
+
+def test_input_reader_reassembles_function_key_split_after_its_prefix(monkeypatch):
+    # A read can end in the middle of a five-byte F-key.  The earlier code only
+    # waited for two-byte sequences, so '\x1b[1' + '5~' leaked '\x1b[15~' as
+    # five separate keystrokes instead of one F5.
+    class FakeStdin:
+        @staticmethod
+        def fileno():
+            return 10
+
+    pressed = []
+    chunks = iter((b'\x1b[1', b'5~'))
+    monkeypatch.setattr('rosmon2.terminal.sys.stdin', FakeStdin())
+    monkeypatch.setattr('rosmon2.terminal.os.read', lambda _fd, _size: next(chunks))
+    ui = TerminalUI(False, pressed.append)
+
+    ui._read_input()
+    assert pressed == []
+    ui._read_input()
+
+    assert pressed == ['F5']
+
+
+def test_close_tolerates_a_broken_stdout(monkeypatch):
+    # run() calls close() from a finally block, so a write to an already closed
+    # terminal must not raise and mask the original failure.
+    class BrokenStdout:
+        @staticmethod
+        def write(_text):
+            raise OSError('stream is closed')
+
+        @staticmethod
+        def flush():
+            pass
+
+    ui = TerminalUI(False, lambda _key: None)
+    ui.enabled = True
+    ui._started = True
+    ui._status_lines = 0
+    ui._saved_termios = None
+    monkeypatch.setattr('rosmon2.terminal.sys.stdout', BrokenStdout())
+
+    ui.close()
+
+    assert not ui._started

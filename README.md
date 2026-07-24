@@ -9,6 +9,45 @@ and includes.
 an independent ROS 2 implementation and does not require ROS 1.
 
 
+## Overview
+
+A large ROS 2 system starts many nodes from one launch file, and the default
+`ros2 launch` output interleaves every node's logs with no easy way to see
+which processes are alive or to restart one without killing the whole launch.
+`rosmon2` runs the same launch file but keeps a live status bar of every
+process and lets you start, stop, restart, and mute each one on its own while
+the rest of the system keeps running.
+
+One supervisor sits behind three front ends, all driving the same process tree:
+
+- an interactive terminal UI for working at the keyboard,
+- a JSON command-line client (`mon2 status`, `mon2 restart`, and so on) for
+  scripts and CI,
+- an MCP server so a coding agent can inspect and control a running session.
+
+### Key features
+
+- Runs any Python, XML, or YAML ROS 2 launch file unchanged, including its
+  launch arguments, substitutions, and includes.
+- Live per-process status showing state, PID, exit code, and restart count.
+- Per-node and per-namespace start, stop, restart, and mute from the keyboard.
+- Node search and namespace grouping for launches with many processes.
+- Named sessions over a private per-user Unix socket, with JSON status, log
+  queries, a live event stream, and deterministic waits on process state.
+- A dependency-free MCP stdio server for agent-driven inspection and control.
+- Combined process output saved to a log file for later inspection.
+
+### Use cases
+
+- Bringing up a robot from a big launch file and restarting a single driver
+  that crashed, without restarting everything else.
+- Seeing at a glance which nodes are alive, muting the noisy ones, and cutting
+  the output down to warnings and errors.
+- Driving a launch from a script or CI job and waiting for specific nodes to
+  reach a state before the next step runs.
+- Letting a coding agent read status and logs, or restart a node, over MCP.
+
+
 ## Screenshot
 
 ![rosmon2 terminal process monitor](docs/rosmon2-terminal.png)
@@ -137,8 +176,9 @@ Write combined stdout and stderr to a chosen file:
 mon2 launch --log ./system.log --flush-log my_package system.launch.py
 ```
 
-By default, process output is also written to a timestamped file under
-`/tmp/rosmon2_*.log`. Use `mon2 launch --help` to see every option.
+By default, process output is also written to a uniquely named file such as
+`/tmp/rosmon2_*.log` in your system temporary directory. Use
+`mon2 launch --help` to see every option.
 
 ### Agent control and JSON output
 
@@ -222,9 +262,8 @@ revision `2025-06-18`. It exposes these tools:
 - `rosmon2_start`, `rosmon2_stop`, and `rosmon2_restart`
 - `rosmon2_mute` and `rosmon2_unmute`
 
-After building the workspace, register it with Codex from the workspace root.
-The explicit setup and runtime paths let Codex use the server when it is
-started from another repository:
+After building the workspace, register the server with Codex from the
+workspace root:
 
 ```bash
 rosmon2_setup="$(realpath install/setup.bash)"
@@ -241,9 +280,10 @@ codex mcp add rosmon2 \
 codex mcp list
 ```
 
-If `rosmon2` was registered previously with only
-`codex mcp add rosmon2 -- rosmon2-mcp`, remove that entry with
-`codex mcp remove rosmon2` before registering it again.
+The `ROSMON2_SETUP` and `ROSMON2_RUNTIME_DIR` variables let the server find the
+built workspace and the session sockets even when Codex starts it from another
+repository. If you registered `rosmon2` before under the same name, remove the
+old entry with `codex mcp remove rosmon2` first.
 
 ### Test with Codex CLI
 

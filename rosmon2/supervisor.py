@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import shutil
 import sys
 import time
 from collections import deque
@@ -20,7 +21,7 @@ from launch_ros.actions import Node
 from ros2launch.api.api import parse_launch_arguments
 
 from .control import ControlError, ControlServer
-from .model import ProcessRecord, selection_key, State
+from .model import full_name, namespace_of, ProcessRecord, selection_key, State
 from .terminal import TerminalUI
 
 
@@ -79,33 +80,38 @@ class Supervisor:
 
     async def run(self) -> int:
         """Run until the launch service is idle or the user interrupts it."""
-        handlers = [
-            RegisterEventHandler(OnProcessStart(on_start=self._on_start)),
-            RegisterEventHandler(OnProcessIO(
-                on_stdout=lambda event: self._on_output(event, False),
-                on_stderr=lambda event: self._on_output(event, True),
-            )),
-            RegisterEventHandler(OnProcessExit(on_exit=self._on_exit)),
-        ]
-        include = IncludeLaunchDescription(
-            AnyLaunchDescriptionSource(self.launch_file),
-            launch_arguments=parse_launch_arguments(self.launch_arguments),
-        )
-        description = LaunchDescription(handlers + [include])
-        self._launch_service = LaunchService(argv=self.launch_arguments, noninteractive=True)
-        self._launch_service.include_launch_description(description)
         loop = asyncio.get_running_loop()
         screen_handler = None
         original_stream = None
-        if self.ui.enabled or self.json_events:
-            # launch writes directly to stdout by default, which can overwrite
-            # our persistent status bar.  Preserve its messages but route them
-            # through the same erase/log/redraw path as process output.
-            screen_handler = launch.logging.launch_config.get_screen_handler()
-            original_stream = screen_handler.setStream(_UILogStream(self.ui))
         control_started = False
         session_started = False
+        # Everything below runs inside the try so that a failure while parsing
+        # launch arguments or resolving the launch file still releases the log
+        # file handle and the control socket.
         try:
+            handlers = [
+                RegisterEventHandler(OnProcessStart(on_start=self._on_start)),
+                RegisterEventHandler(OnProcessIO(
+                    on_stdout=lambda event: self._on_output(event, False),
+                    on_stderr=lambda event: self._on_output(event, True),
+                )),
+                RegisterEventHandler(OnProcessExit(on_exit=self._on_exit)),
+            ]
+            include = IncludeLaunchDescription(
+                AnyLaunchDescriptionSource(self.launch_file),
+                launch_arguments=parse_launch_arguments(self.launch_arguments),
+            )
+            description = LaunchDescription(handlers + [include])
+            self._launch_service = LaunchService(
+                argv=self.launch_arguments, noninteractive=True)
+            self._launch_service.include_launch_description(description)
+            if self.ui.enabled or self.json_events:
+                # launch writes directly to stdout by default, which can
+                # overwrite our persistent status bar.  Preserve its messages
+                # but route them through the same erase/log/redraw path as
+                # process output.
+                screen_handler = launch.logging.launch_config.get_screen_handler()
+                original_stream = screen_handler.setStream(_UILogStream(self.ui))
             if self._control_server is not None:
                 await self._control_server.start()
                 control_started = True
@@ -129,8 +135,13 @@ class Supervisor:
             self.ui.close(loop)
             if self._control_server is not None and control_started:
                 await self._control_server.close()
-            if self._log_handle:
-                self._log_handle.close()
+            self.close_log()
+
+    def close_log(self) -> None:
+        """Release the combined process log file handle."""
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
 
     async def shutdown(self) -> None:
         if self._shutting_down:
@@ -152,7 +163,13 @@ class Supervisor:
         elif record.pid is not None:
             record.restart_count += 1
         record.action = event.action
-        record.cmd = list(event.cmd)
+        if getattr(event.action, '_rosmon2_record', None) is None:
+            # Only capture the command from actions launch created for us.  Our
+            # own restart actions are built from record.cmd, and overwriting it
+            # here would make a one-shot `d` (gdb) run stick permanently,
+            # because ExecuteProcess.execute() starts asynchronously and this
+            # runs after debug() has already restored the original command.
+            record.cmd = list(event.cmd)
         record.cwd = event.cwd
         record.env = dict(event.env) if event.env else None
         record.pid = event.pid
@@ -160,7 +177,8 @@ class Supervisor:
         record.state = State.RUNNING
         self._by_action[event.action] = record
         self._silence_native_process_screen_logger(event.process_name)
-        self._write_log(record.display_name, f'process started with pid {event.pid}', False)
+        self._write_log(
+            record.display_name, [f'process started with pid {event.pid}'], False)
         self._emit_event('node_started', node=self._record_dict(record))
         if self.no_start and record.key not in self._no_start_applied:
             self._no_start_applied.add(record.key)
@@ -222,19 +240,24 @@ class Supervisor:
         record = self._by_action.get(event.action)
         source = record.display_name if record else event.process_name
         text = event.text.decode(errors='replace')
-        self._write_log(source, text.rstrip('\n'), is_stderr)
-        self._record_output(source, text, is_stderr)
+        # Process output is the hottest path in the monitor, so normalise,
+        # split, and classify each chunk once and share the result with the
+        # log file, the event stream, and the terminal.
+        lines = text.replace('\r\n', '\n').replace('\r', '\n').splitlines()
+        severities = [self.ui._severity(line, None, is_stderr) for line in lines]
+        self._write_log(source, lines, is_stderr)
+        self._record_output(source, lines, severities, is_stderr)
         if record is None or not record.muted:
-            self.ui.log(source, text, is_stderr=is_stderr)
+            self.ui.log_lines(source, lines, severities)
         if self.flush_stdout:
             sys.stdout.flush()
 
-    def _write_log(self, source: str, text: str, is_stderr: bool) -> None:
+    def _write_log(self, source: str, lines, is_stderr: bool) -> None:
         if not self._log_handle:
             return
         channel = 'stderr' if is_stderr else 'stdout'
-        for line in text.splitlines() or ['']:
-            self._log_handle.write(f'[{channel}] {source}: {line}\n')
+        self._log_handle.write(''.join(
+            f'[{channel}] {source}: {line}\n' for line in lines or ['']))
 
     def _on_exit(self, event, context):
         record = self._by_action.get(event.action)
@@ -247,7 +270,8 @@ class Supervisor:
         else:
             record.state = State.CRASHED
         self._write_log(record.display_name,
-                        f'process exited with code {event.returncode}', event.returncode != 0)
+                        [f'process exited with code {event.returncode}'],
+                        event.returncode != 0)
         self._emit_event('node_exited', node=self._record_dict(record))
         self.ui.set_records(self.records)
         if record.key in self._pending_restarts:
@@ -447,7 +471,6 @@ class Supervisor:
 
     def debug(self, record: ProcessRecord) -> None:
         """Restart a stopped process under gdb when it is installed."""
-        import shutil
         if shutil.which('gdb') is None:
             self.ui.notice('gdb is not installed; cannot debug this process', error=True)
             return
@@ -482,21 +505,30 @@ class Supervisor:
         }
         event.update(fields)
         for listener in tuple(self._event_listeners):
-            listener(event)
+            try:
+                listener(event)
+            except Exception:
+                # Emission happens inside launch event handlers.  A subscriber
+                # that disconnects mid-write, or a closed --json-events pipe,
+                # must not propagate out and tear down process supervision.
+                logging.getLogger('rosmon2').debug(
+                    'event listener failed', exc_info=True)
         return event
 
     @staticmethod
     def _print_json_event(event: Dict) -> None:
         print(json.dumps(event, separators=(',', ':'), sort_keys=True), flush=True)
 
-    def _record_output(self, source: str, text: str, is_stderr: bool) -> None:
-        for line in text.replace('\r\n', '\n').replace('\r', '\n').splitlines():
-            severity = self.ui._severity(line, None, is_stderr)
+    def _record_output(self, source: str, lines, severities, is_stderr: bool) -> None:
+        stream = 'stderr' if is_stderr else 'stdout'
+        node = full_name(source)
+        for line, severity in zip(lines, severities):
+            now = datetime.now(timezone.utc)
             entry = {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'timestamp_epoch': time.time(),
-                'node': source,
-                'stream': 'stderr' if is_stderr else 'stdout',
+                'timestamp': now.isoformat(),
+                'timestamp_epoch': now.timestamp(),
+                'node': node,
+                'stream': stream,
                 'severity': severity,
                 'message': line,
             }
@@ -507,13 +539,12 @@ class Supervisor:
 
     @staticmethod
     def _namespace_for(record: ProcessRecord) -> str:
-        parts = [part for part in record.display_name.strip('/').split('/') if part]
-        return parts[0] if len(parts) > 1 else '/'
+        return namespace_of(record.display_name)
 
     def _record_dict(self, record: ProcessRecord) -> Dict:
         return {
             'key': record.key,
-            'name': '/' + record.display_name.lstrip('/'),
+            'name': full_name(record.display_name),
             'namespace': self._namespace_for(record),
             'state': record.state.value,
             'pid': record.pid,
@@ -671,7 +702,8 @@ class Supervisor:
         timeout = float(request.get('timeout', 30.0))
         if timeout < 0:
             raise ControlError('timeout cannot be negative')
-        deadline = asyncio.get_running_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while True:
             records = self._selected_records(request, strict=False)
             if records and all(record.state.value == desired for record in records):
@@ -682,10 +714,17 @@ class Supervisor:
                     'matched': len(records),
                     'nodes': [self._record_dict(record) for record in records],
                 }
-            if asyncio.get_running_loop().time() >= deadline:
-                current = [self._record_dict(record) for record in records]
+            if loop.time() >= deadline:
+                if not records:
+                    # A mistyped target otherwise blocks for the whole timeout
+                    # and then reports an empty node list.
+                    target = request.get('node') or request.get('namespace')
+                    raise ControlError(
+                        f'timed out after {timeout:g}s: no process ever matched '
+                        f'target {target!r}'
+                    )
                 raise ControlError(
                     f'timed out after {timeout:g}s waiting for state {desired}; '
-                    f'current nodes: {current}'
+                    f'current nodes: {[self._record_dict(r) for r in records]}'
                 )
             await asyncio.sleep(0.1)

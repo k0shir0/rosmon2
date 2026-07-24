@@ -45,6 +45,35 @@ def session_socket_path(session: str) -> Path:
     return runtime_directory() / f'{session}.sock'
 
 
+def verify_private_directory(directory: Path) -> None:
+    """Refuse a runtime directory another local user could have planted.
+
+    The fallback location is inside a world-writable /tmp, so a directory that
+    already exists may not be ours.  Whoever owns it can swap in their own
+    socket and receive the start/stop/restart requests meant for the real
+    session, so anything that is not a plain, private, self-owned directory is
+    rejected instead of being reused.
+    """
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        raise ControlError(
+            f"rosmon2 runtime path '{directory}' is not a directory"
+        )
+    if info.st_uid != os.getuid():
+        raise ControlError(
+            f"rosmon2 runtime directory '{directory}' is owned by uid "
+            f'{info.st_uid}, not by the current user'
+        )
+    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ControlError(
+            f"rosmon2 runtime directory '{directory}' is accessible to other "
+            'users; remove it or fix its permissions to 0700'
+        )
+
+
 def _encoded(message: Dict) -> bytes:
     return (json.dumps(message, separators=(',', ':'), sort_keys=True) + '\n').encode()
 
@@ -59,6 +88,7 @@ class ControlClient:
 
     def request(self, request: Dict) -> Dict:
         """Send one request and return its response."""
+        verify_private_directory(self.path.parent)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self.timeout)
@@ -85,6 +115,7 @@ class ControlClient:
 
     def events(self) -> Iterator[Dict]:
         """Subscribe to events and yield them until the session exits."""
+        verify_private_directory(self.path.parent)
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             connection.connect(str(self.path))
@@ -134,6 +165,7 @@ class ControlServer:
 
     async def start(self) -> None:
         """Create the session socket, rejecting active name collisions."""
+        verify_private_directory(self.path.parent)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             self.path.parent.chmod(0o700)
@@ -241,13 +273,20 @@ class ControlServer:
         payload = _encoded(event)
         for writer in list(self._subscribers):
             try:
-                transport = writer.transport
-                if transport.get_write_buffer_size() > 1024 * 1024:
+                if writer.is_closing():
+                    self._subscribers.discard(writer)
+                    continue
+                if writer.transport.get_write_buffer_size() > 1024 * 1024:
+                    # A subscriber that stopped reading must not grow the
+                    # supervisor's memory without bound.
                     self._subscribers.discard(writer)
                     writer.close()
                     continue
                 writer.write(payload)
-            except (BrokenPipeError, ConnectionResetError):
+            except (OSError, AttributeError, RuntimeError):
+                # A transport torn down between the check and the write raises
+                # from inside a launch event handler, where an escaping
+                # exception would stop process supervision.
                 self._subscribers.discard(writer)
 
     @staticmethod

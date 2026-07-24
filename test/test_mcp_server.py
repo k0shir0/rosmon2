@@ -1,4 +1,19 @@
+import io
+
 from rosmon2 import mcp_server
+
+
+def test_mcp_main_skips_blank_keepalive_lines(monkeypatch, capsys):
+    monkeypatch.setattr(
+        'sys.stdin',
+        io.StringIO('\n{"jsonrpc":"2.0","id":1,"method":"ping"}\n\n'))
+
+    mcp_server.main()
+
+    replies = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(replies) == 1
+    assert '"error"' not in replies[0]
+    assert '"id":1' in replies[0]
 
 
 def test_mcp_advertises_rosmon2_tools():

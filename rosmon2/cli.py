@@ -3,8 +3,10 @@
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from ros2launch.api import get_share_file_path_from_package
 from ros2launch.api import print_arguments_of_launch_file
 
 from .control import ControlClient, ControlError, validate_session_name
+from .model import State
 from .supervisor import Supervisor
 
 
@@ -82,8 +85,9 @@ def make_parser() -> argparse.ArgumentParser:
         'logs', help='query recent structured process logs')
     add_client_options(logs_parser)
     add_target_options(logs_parser)
-    logs_parser.add_argument('--severity', choices=['DEBUG', 'INFO', 'WARN', 'WARNING',
-                                                   'ERROR', 'FATAL'])
+    logs_parser.add_argument(
+        '--severity',
+        choices=['DEBUG', 'INFO', 'WARN', 'WARNING', 'ERROR', 'FATAL'])
     logs_parser.add_argument('--since', type=float, default=0, metavar='SECONDS')
     logs_parser.add_argument('--limit', type=int, default=200)
 
@@ -102,8 +106,8 @@ def make_parser() -> argparse.ArgumentParser:
     add_client_options(wait_parser)
     add_target_options(wait_parser)
     wait_parser.add_argument(
-        '--state', choices=[state for state in ('running', 'idle', 'crashed', 'waiting')],
-        default='running')
+        '--state', choices=[state.value for state in State],
+        default=State.RUNNING.value)
     wait_parser.add_argument('--timeout', type=float, default=30.0)
     return parser
 
@@ -127,6 +131,21 @@ def resolve_launch_spec(parts):
         except PackageNotFoundError as exc:
             raise FileNotFoundError(f"ROS 2 package '{package}' was not found") from exc
     raise ValueError('expected either a launch file path or PACKAGE FILE')
+
+
+def _default_log_file() -> str:
+    """Create the default process log safely inside a shared temp directory.
+
+    The old timestamped name was predictable, and opening it with 'a' follows
+    symlinks, so any local user could pre-create the path and have rosmon2
+    append process output to a file of their choosing.  mkstemp() creates the
+    file itself with O_EXCL and mode 0600, which removes both problems while
+    keeping the documented rosmon2_*.log naming.
+    """
+    stamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+    handle, path = tempfile.mkstemp(prefix=f'rosmon2_{stamp}_', suffix='.log')
+    os.close(handle)
+    return path
 
 
 async def _run_supervisor(supervisor: Supervisor) -> int:
@@ -176,8 +195,7 @@ def main(argv=None) -> int:
     if log_file == 'syslog':
         parser.error('--log=syslog is not available; use a file path with ROS 2')
     if not log_file:
-        stamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-        log_file = f'/tmp/rosmon2_{stamp}.log'
+        log_file = _default_log_file()
         if not args.json_events:
             print(f'Tip: process output is also written to {log_file}')
 

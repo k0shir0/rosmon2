@@ -9,7 +9,7 @@ import termios
 import tty
 from typing import Callable, Iterable, Optional
 
-from .model import ProcessRecord, selection_key, State
+from .model import namespace_of, ProcessRecord, selection_key, State
 
 
 ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
@@ -19,6 +19,18 @@ RGB_MATRIX = (
     (-0.9689, 1.8758, 0.0415),
     (0.0557, -0.2040, 1.0570),
 )
+KEY_SEQUENCES = {
+    '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
+    '\x1b[20~': 'F9', '\x1b[21~': 'F10',
+    '\x1b[A': 'UP', '\x1b[B': 'DOWN',
+    '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
+}
+SEVERITY_STYLES = {
+    'DEBUG': '\x1b[32m',
+    'WARNING': '\x1b[33m',
+    'ERROR': '\x1b[31m',
+    'FATAL': '\x1b[1;31m',
+}
 
 
 def _hsluv_label_color(hue: float):
@@ -79,13 +91,24 @@ class TerminalUI:
     SEARCH_SELECTED = '\x1b[38;2;0;0;0m\x1b[48;2;0;178;178m'
     KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
     MUTED_KEY = '\x1b[38;2;255;255;255m\x1b[48;2;165;0;0m'
+    STATE_STYLES = {
+        State.RUNNING: RUNNING,
+        State.CRASHED: CRASHED,
+        State.WAITING: WAITING,
+        State.IDLE: IDLE,
+    }
 
     def __init__(self, enabled: bool, on_key: Callable[[str], None],
                  output_enabled: bool = True):
         self.enabled = bool(enabled and sys.stdin.isatty() and sys.stdout.isatty())
         self.output_enabled = output_enabled
         self.on_key = on_key
-        self.records: Iterable[ProcessRecord] = []
+        # Label colours and the label column width depend only on the record
+        # list but are needed for every output line, so they are cached and
+        # rebuilt whenever the records change rather than recomputed per line.
+        self._label_colors = {}
+        self._label_width = 8
+        self._records: Iterable[ProcessRecord] = []
         self.selected: Optional[int] = None
         self.namespace_mode = False
         self.namespace_inspect: Optional[str] = None
@@ -99,6 +122,15 @@ class TerminalUI:
         self._loop = None
         self._escape_timer = None
         self._started = False
+
+    @property
+    def records(self) -> Iterable[ProcessRecord]:
+        return self._records
+
+    @records.setter
+    def records(self, records: Iterable[ProcessRecord]) -> None:
+        self._records = records
+        self._rebuild_label_cache()
 
     def start(self, loop) -> None:
         """Enter raw input mode and register the keyboard reader."""
@@ -131,21 +163,41 @@ class TerminalUI:
             self._escape_timer.cancel()
             self._escape_timer = None
         self._erase_status()
-        sys.stdout.write(self.RESET + '\x1b[?25h')
-        sys.stdout.flush()
+        # Restoring the terminal must not raise: run() calls close() from a
+        # finally block, where an exception would mask the real failure and
+        # skip the remaining cleanup.
+        try:
+            sys.stdout.write(self.RESET + '\x1b[?25h')
+            sys.stdout.flush()
+        except OSError:
+            pass
         if self._saved_termios is not None:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved_termios)
+            try:
+                termios.tcsetattr(
+                    sys.stdin.fileno(), termios.TCSADRAIN, self._saved_termios)
+            except termios.error:
+                pass
         self._started = False
 
     def set_records(self, records: Iterable[ProcessRecord]) -> None:
         self.records = records
         self.redraw()
 
+    def _rebuild_label_cache(self) -> None:
+        """Recompute the per-process label colour and label column width."""
+        records = list(self.records)
+        total = max(1, len(records))
+        self._label_colors = {
+            record.display_name: _hsluv_label_color(index * 360.0 / total)
+            for index, record in enumerate(records)
+        }
+        self._label_width = max(
+            [len(record.display_name) for record in records] + [8])
+
     @staticmethod
     def namespace_for(record: ProcessRecord) -> str:
         """Return the top-level namespace containing a process."""
-        parts = [part for part in record.display_name.strip('/').split('/') if part]
-        return parts[0] if len(parts) > 1 else '/'
+        return namespace_of(record.display_name)
 
     def namespaces(self):
         """Return stable namespace groups represented by the current records."""
@@ -187,45 +239,47 @@ class TerminalUI:
     @classmethod
     def state_style(cls, state: State):
         """Return the status color for one process state."""
-        return {
-            State.RUNNING: cls.RUNNING,
-            State.CRASHED: cls.CRASHED,
-            State.WAITING: cls.WAITING,
-            State.IDLE: cls.IDLE,
-        }[state]
+        return cls.STATE_STYLES[state]
 
     def log(self, source: str, text: str, is_stderr: bool = False,
             severity: Optional[str] = None) -> None:
         """Print one or more process output lines above the status bar."""
+        clean = text.replace('\r\n', '\n').replace('\r', '\n')
+        lines = clean.splitlines()
+        self.log_lines(source, lines,
+                       [self._severity(line, severity, is_stderr) for line in lines])
+
+    def log_lines(self, source: str, lines, severities) -> None:
+        """Print already split and classified output above the status bar.
+
+        The supervisor splits process output and resolves severities once and
+        feeds the result to the log file, the event stream, and the terminal,
+        so none of that work is repeated per consumer.
+        """
         if not self.output_enabled:
             return
         self._erase_status()
-        width = max([len(r.display_name) for r in self.records] + [len(source), 8])
-        clean = text.replace('\r\n', '\n').replace('\r', '\n')
-        for line in clean.splitlines():
-            line_severity = self._severity(line, severity, is_stderr)
+        width = max(self._label_width, len(source))
+        label = f'{source:>{width}}:'
+        if self.enabled:
+            background = self._label_color(source)
+            if background is None:
+                label = '\x1b[38;2;178;178;178m' + label + self.RESET
+            else:
+                red, green, blue = background
+                label = (
+                    f'\x1b[48;2;{red};{green};{blue}m'
+                    '\x1b[38;2;255;255;255m' + label + self.RESET
+                )
+        write = sys.stdout.write
+        for line, line_severity in zip(lines, severities):
             if self.warn_only and line_severity not in ('WARNING', 'ERROR', 'FATAL'):
                 continue
-            label = f'{source:>{width}}:'
             if self.enabled:
-                background = self._label_color(source)
-                if background is None:
-                    label = '\x1b[38;2;178;178;178m' + label + self.RESET
-                else:
-                    red, green, blue = background
-                    label = (
-                        f'\x1b[48;2;{red};{green};{blue}m'
-                        '\x1b[38;2;255;255;255m' + label + self.RESET
-                    )
-                style = {
-                    'DEBUG': '\x1b[32m',
-                    'WARNING': '\x1b[33m',
-                    'ERROR': '\x1b[31m',
-                    'FATAL': '\x1b[1;31m',
-                }.get(line_severity, '')
+                style = SEVERITY_STYLES.get(line_severity)
                 if style:
                     line = style + line + self.RESET
-            sys.stdout.write(f'{label} {line}\n')
+            write(f'{label} {line}\n')
         sys.stdout.flush()
         self.redraw()
 
@@ -235,7 +289,9 @@ class TerminalUI:
     @staticmethod
     def _severity(line: str, explicit: Optional[str], is_stderr: bool) -> str:
         """Determine severity without assuming all ROS stderr output is an error."""
-        match = SEVERITY_RE.search(ANSI_RE.sub('', line))
+        # Stripping ANSI codes allocates a copy of every line, so only pay for
+        # it when the line actually carries an escape sequence.
+        match = SEVERITY_RE.search(ANSI_RE.sub('', line) if '\x1b' in line else line)
         value = match.group(1) if match else explicit
         if value == 'WARN':
             value = 'WARNING'
@@ -245,13 +301,8 @@ class TerminalUI:
 
     def _label_color(self, source: str):
         """Return a stable foreground/background pair for a process label."""
-        records = list(self.records)
-        for index, record in enumerate(records):
-            if record.display_name == source:
-                hue = index * 360.0 / max(1, len(records))
-                return _hsluv_label_color(hue)
         # Framework messages are plain gray, as rosmon's own messages are.
-        return None
+        return self._label_colors.get(source)
 
     def redraw(self) -> None:
         if not self.enabled or not self._started:
@@ -299,7 +350,8 @@ class TerminalUI:
                     self.selected = None
                     return self.redraw()
                 record = records[self.selected]
-                menu = self.BAR + f" Node '{record.display_name}' is {record.state.value}. Actions:"
+                menu = self.BAR + (
+                    f" Node '{record.display_name}' is {record.state.value}. Actions:")
                 menu += self._menu_item('s', 'start')
                 menu += self._menu_item('k', 'stop')
                 menu += self._menu_item('d', 'debug')
@@ -326,6 +378,10 @@ class TerminalUI:
 
         blocks = []
         line = ''
+        # Track the visible width as blocks are appended.  Re-measuring the
+        # accumulated line with _visible_len() made every redraw quadratic in
+        # the number of processes, and a redraw happens for every output line.
+        line_width = 0
         for index, (display_name, state_style, muted) in enumerate(entries):
             if self.search_active:
                 name = display_name.lstrip('/')
@@ -336,11 +392,12 @@ class TerminalUI:
                 style = self.SEARCH_SELECTED if self.search_selected == index else ''
                 block = style + label + self.RESET
                 plain_len = len(label)
-                if self._visible_len(line) + plain_len + 1 > columns and line:
+                if line_width + plain_len + 1 > columns and line:
                     blocks.append(line)
-                    line = block
+                    line, line_width = block, plain_len
                 else:
                     line += (' ' if line else '') + block
+                    line_width += plain_len + (1 if line_width else 0)
                 continue
 
             key = selection_key(index)
@@ -361,11 +418,12 @@ class TerminalUI:
             )
             block = key_style + key_text + label_style + label + self.RESET
             plain_len = 1 + len(label)
-            if self._visible_len(line) + plain_len + 1 > columns and line:
+            if line_width + plain_len + 1 > columns and line:
                 blocks.append(line)
-                line = block
+                line, line_width = block, plain_len
             else:
                 line += (' ' if line else '') + block
+                line_width += plain_len + (1 if line_width else 0)
         if line:
             blocks.append(line)
         if not blocks:
@@ -395,15 +453,9 @@ class TerminalUI:
             self._escape_timer.cancel()
             self._escape_timer = None
         self._buffer += data
-        keys = {
-            '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
-            '\x1b[20~': 'F9', '\x1b[21~': 'F10',
-            '\x1b[A': 'UP', '\x1b[B': 'DOWN',
-            '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
-        }
         while self._buffer:
             matched = False
-            for sequence, name in keys.items():
+            for sequence, name in KEY_SEQUENCES.items():
                 if self._buffer.startswith(sequence):
                     self._buffer = self._buffer[len(sequence):]
                     self.on_key(name)
@@ -417,7 +469,10 @@ class TerminalUI:
                     continue
                 self._escape_timer = self._loop.call_later(0.03, self._flush_escape)
                 break
-            if self._buffer.startswith('\x1b') and len(self._buffer) < 3:
+            # A read can end part-way through a function key.  Wait for the
+            # rest instead of emitting the fragment as individual keystrokes;
+            # F5-F10 are five bytes, so a fixed length check is not enough.
+            if any(sequence.startswith(self._buffer) for sequence in KEY_SEQUENCES):
                 break
             char, self._buffer = self._buffer[0], self._buffer[1:]
             self.on_key(char)

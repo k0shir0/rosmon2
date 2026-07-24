@@ -216,6 +216,10 @@ def _response(request: Dict) -> Dict:
 def main() -> int:
     """Run an MCP server using newline-delimited JSON-RPC over stdio."""
     for line in sys.stdin:
+        # Blank lines are used as keepalives by some MCP clients and carry no
+        # message, so skip them instead of answering with a parse error.
+        if not line.strip():
+            continue
         try:
             request = json.loads(line)
             if not isinstance(request, dict):

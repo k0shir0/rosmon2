@@ -1,7 +1,16 @@
 import asyncio
 import json
+import os
 
-from rosmon2.control import ControlServer, session_socket_path, validate_session_name
+import pytest
+
+from rosmon2.control import (
+    ControlError,
+    ControlServer,
+    session_socket_path,
+    validate_session_name,
+    verify_private_directory,
+)
 
 
 class FakeSupervisor:
@@ -30,6 +39,49 @@ def test_session_name_rejects_path_characters():
         assert 'session names' in str(exc)
     else:
         raise AssertionError('unsafe session name was accepted')
+
+
+def test_verify_private_directory_accepts_a_missing_or_private_path(tmp_path):
+    verify_private_directory(tmp_path / 'not_created_yet')
+
+    private = tmp_path / 'rt'
+    private.mkdir()
+    os.chmod(private, 0o700)
+    verify_private_directory(private)
+
+
+def test_verify_private_directory_rejects_a_world_accessible_path(tmp_path):
+    shared = tmp_path / 'rt'
+    shared.mkdir()
+    os.chmod(shared, 0o777)
+
+    with pytest.raises(ControlError) as excinfo:
+        verify_private_directory(shared)
+
+    assert 'accessible to other users' in str(excinfo.value)
+
+
+def test_verify_private_directory_rejects_a_non_directory(tmp_path):
+    plain = tmp_path / 'rt'
+    plain.write_text('')
+
+    with pytest.raises(ControlError):
+        verify_private_directory(plain)
+
+
+def test_control_server_rejects_a_world_accessible_runtime_directory(
+        monkeypatch, tmp_path):
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    os.chmod(shared, 0o777)
+    monkeypatch.setenv('ROSMON2_RUNTIME_DIR', str(shared))
+
+    async def scenario():
+        server = ControlServer(FakeSupervisor(), 'sess')
+        with pytest.raises(ControlError):
+            await server.start()
+
+    asyncio.run(scenario())
 
 
 def test_control_server_handles_requests_and_streams_events(monkeypatch, tmp_path):
