@@ -38,9 +38,8 @@ class _UILogStream:
             self._ui.log('launch', message)
         return len(message)
 
-    @staticmethod
-    def flush() -> None:
-        sys.stdout.flush()
+    def flush(self) -> None:
+        self._ui.flush()
 
 
 class Supervisor:
@@ -240,17 +239,17 @@ class Supervisor:
         record = self._by_action.get(event.action)
         source = record.display_name if record else event.process_name
         text = event.text.decode(errors='replace')
-        # Process output is the hottest path in the monitor, so normalise,
-        # split, and classify each chunk once and share the result with the
-        # log file, the event stream, and the terminal.
+        # Split and classify the chunk once for the log file and the structured
+        # event stream, which both keep the raw message.  The terminal display
+        # does its own trimming and batching in TerminalUI.log().
         lines = text.replace('\r\n', '\n').replace('\r', '\n').splitlines()
         severities = [self.ui._severity(line, None, is_stderr) for line in lines]
         self._write_log(source, lines, is_stderr)
         self._record_output(source, lines, severities, is_stderr)
         if record is None or not record.muted:
-            self.ui.log_lines(source, lines, severities)
+            self.ui.log(source, text, is_stderr=is_stderr)
         if self.flush_stdout:
-            sys.stdout.flush()
+            self.ui.flush()
 
     def _write_log(self, source: str, lines, is_stderr: bool) -> None:
         if not self._log_handle:

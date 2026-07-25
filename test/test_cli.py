@@ -3,7 +3,12 @@ import stat
 
 import pytest
 
-from rosmon2.cli import _default_log_file, resolve_launch_spec
+from rosmon2.cli import (
+    _default_log_file,
+    configure_ros_console_output,
+    resolve_launch_spec,
+    ROSMON_CONSOLE_OUTPUT_FORMAT,
+)
 
 
 def test_resolve_file_and_arguments(tmp_path):
@@ -34,3 +39,16 @@ def test_default_log_file_is_unique_and_private():
     finally:
         os.unlink(first)
         os.unlink(second)
+
+
+def test_rosmon_console_format_uses_function_and_respects_override(monkeypatch):
+    monkeypatch.delenv('RCUTILS_CONSOLE_OUTPUT_FORMAT', raising=False)
+    configure_ros_console_output()
+    assert (
+        os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT']
+        == ROSMON_CONSOLE_OUTPUT_FORMAT
+    )
+
+    monkeypatch.setenv('RCUTILS_CONSOLE_OUTPUT_FORMAT', '{message}')
+    configure_ros_console_output()
+    assert os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT'] == '{message}'

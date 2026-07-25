@@ -3,34 +3,29 @@
 from math import cos, pi, sin
 import os
 import re
+import signal
 import shutil
 import sys
 import termios
+import time
 import tty
 from typing import Callable, Iterable, Optional
 
-from .model import namespace_of, ProcessRecord, selection_key, State
+from .model import ProcessRecord, selection_key, State
 
 
 ANSI_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 SEVERITY_RE = re.compile(r'\[(DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]')
+ROS_CONSOLE_PREFIX_RE = re.compile(
+    r'^\s*\[(?:DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]'
+    r'(?:\s+\[[^\]\r\n]*\])*\s+\[(?P<context>[^\]\r\n]*)\]'
+    r'\s*:\s*(?P<message>.*)$'
+)
 RGB_MATRIX = (
     (3.2406, -1.5372, -0.4986),
     (-0.9689, 1.8758, 0.0415),
     (0.0557, -0.2040, 1.0570),
 )
-KEY_SEQUENCES = {
-    '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
-    '\x1b[20~': 'F9', '\x1b[21~': 'F10',
-    '\x1b[A': 'UP', '\x1b[B': 'DOWN',
-    '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
-}
-SEVERITY_STYLES = {
-    'DEBUG': '\x1b[32m',
-    'WARNING': '\x1b[33m',
-    'ERROR': '\x1b[31m',
-    'FATAL': '\x1b[1;31m',
-}
 
 
 def _hsluv_label_color(hue: float):
@@ -77,6 +72,10 @@ def _hsluv_label_color(hue: float):
 class TerminalUI:
     """Render streaming logs with a persistent rosmon-style status bar."""
 
+    OUTPUT_FLUSH_INTERVAL = 1.0 / 60.0
+    OUTPUT_BUFFER_LIMIT = 64 * 1024
+    REDRAW_INTERVAL = 1.0 / 30.0
+    RESIZE_REDRAW_DELAY = 0.10
     RESET = '\x1b[0m'
     # Exact true-color styles from rosmon's UI. Its packed 0xBBGGRR values
     # 0x404000, 0x606000, and 0xC8C8C8 become the RGB values below.
@@ -91,24 +90,13 @@ class TerminalUI:
     SEARCH_SELECTED = '\x1b[38;2;0;0;0m\x1b[48;2;0;178;178m'
     KEY = '\x1b[38;2;0;0;0m\x1b[48;2;200;200;200m'
     MUTED_KEY = '\x1b[38;2;255;255;255m\x1b[48;2;165;0;0m'
-    STATE_STYLES = {
-        State.RUNNING: RUNNING,
-        State.CRASHED: CRASHED,
-        State.WAITING: WAITING,
-        State.IDLE: IDLE,
-    }
 
     def __init__(self, enabled: bool, on_key: Callable[[str], None],
                  output_enabled: bool = True):
         self.enabled = bool(enabled and sys.stdin.isatty() and sys.stdout.isatty())
         self.output_enabled = output_enabled
         self.on_key = on_key
-        # Label colours and the label column width depend only on the record
-        # list but are needed for every output line, so they are cached and
-        # rebuilt whenever the records change rather than recomputed per line.
-        self._label_colors = {}
-        self._label_width = 8
-        self._records: Iterable[ProcessRecord] = []
+        self.records: Iterable[ProcessRecord] = []
         self.selected: Optional[int] = None
         self.namespace_mode = False
         self.namespace_inspect: Optional[str] = None
@@ -121,20 +109,28 @@ class TerminalUI:
         self._buffer = ''
         self._loop = None
         self._escape_timer = None
+        self._output_timer = None
+        self._output_buffer = []
+        self._output_buffer_size = 0
+        self._redraw_timer = None
+        self._resize_timer = None
+        self._resize_handler_registered = False
+        self._last_redraw_at = 0.0
+        self._render_cache_key = None
+        self._render_cache_lines = None
+        self._label_names = None
+        self._label_width = 8
+        self._label_colors = {}
+        self._plain_labels = {}
+        self._styled_labels = {}
         self._started = False
-
-    @property
-    def records(self) -> Iterable[ProcessRecord]:
-        return self._records
-
-    @records.setter
-    def records(self, records: Iterable[ProcessRecord]) -> None:
-        self._records = records
-        self._rebuild_label_cache()
 
     def start(self, loop) -> None:
         """Enter raw input mode and register the keyboard reader."""
-        if not self.enabled or self._started:
+        if self._started:
+            return
+        self._loop = loop
+        if not self.enabled:
             return
         self._saved_termios = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
@@ -144,15 +140,26 @@ class TerminalUI:
         # shut down the complete LaunchService.  add_reader() only invokes
         # _read_input when data is ready, so blocking terminal I/O is safe.
         os.set_blocking(sys.stdout.fileno(), True)
-        self._loop = loop
         loop.add_reader(sys.stdin.fileno(), self._read_input)
         sys.stdout.write('\x1b[?25l')
         sys.stdout.flush()
         self._started = True
+        add_signal_handler = getattr(loop, 'add_signal_handler', None)
+        if add_signal_handler is not None:
+            try:
+                add_signal_handler(signal.SIGWINCH, self._schedule_resize_redraw)
+                self._resize_handler_registered = True
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
 
     def close(self, loop=None) -> None:
         """Restore the user's terminal even when launch was interrupted."""
+        if self._output_timer is not None:
+            self._output_timer.cancel()
+            self._output_timer = None
+        self._flush_output(redraw=False)
         if not self._started:
+            self._loop = None
             return
         if loop is not None:
             try:
@@ -162,6 +169,19 @@ class TerminalUI:
         if self._escape_timer is not None:
             self._escape_timer.cancel()
             self._escape_timer = None
+        if self._redraw_timer is not None:
+            self._redraw_timer.cancel()
+            self._redraw_timer = None
+        if self._resize_timer is not None:
+            self._resize_timer.cancel()
+            self._resize_timer = None
+        resize_loop = loop if loop is not None else self._loop
+        if self._resize_handler_registered and resize_loop is not None:
+            try:
+                resize_loop.remove_signal_handler(signal.SIGWINCH)
+            except (AttributeError, NotImplementedError, RuntimeError, ValueError):
+                pass
+            self._resize_handler_registered = False
         self._erase_status()
         # Restoring the terminal must not raise: run() calls close() from a
         # finally block, where an exception would mask the real failure and
@@ -178,26 +198,20 @@ class TerminalUI:
             except termios.error:
                 pass
         self._started = False
+        self._loop = None
 
     def set_records(self, records: Iterable[ProcessRecord]) -> None:
         self.records = records
+        names = tuple(record.display_name for record in records)
+        if names != self._label_names:
+            self._rebuild_label_cache(names)
         self.redraw()
-
-    def _rebuild_label_cache(self) -> None:
-        """Recompute the per-process label colour and label column width."""
-        records = list(self.records)
-        total = max(1, len(records))
-        self._label_colors = {
-            record.display_name: _hsluv_label_color(index * 360.0 / total)
-            for index, record in enumerate(records)
-        }
-        self._label_width = max(
-            [len(record.display_name) for record in records] + [8])
 
     @staticmethod
     def namespace_for(record: ProcessRecord) -> str:
         """Return the top-level namespace containing a process."""
-        return namespace_of(record.display_name)
+        parts = [part for part in record.display_name.strip('/').split('/') if part]
+        return parts[0] if len(parts) > 1 else '/'
 
     def namespaces(self):
         """Return stable namespace groups represented by the current records."""
@@ -239,59 +253,59 @@ class TerminalUI:
     @classmethod
     def state_style(cls, state: State):
         """Return the status color for one process state."""
-        return cls.STATE_STYLES[state]
+        return {
+            State.RUNNING: cls.RUNNING,
+            State.CRASHED: cls.CRASHED,
+            State.WAITING: cls.WAITING,
+            State.IDLE: cls.IDLE,
+        }[state]
 
     def log(self, source: str, text: str, is_stderr: bool = False,
             severity: Optional[str] = None) -> None:
         """Print one or more process output lines above the status bar."""
-        clean = text.replace('\r\n', '\n').replace('\r', '\n')
-        lines = clean.splitlines()
-        self.log_lines(source, lines,
-                       [self._severity(line, severity, is_stderr) for line in lines])
-
-    def log_lines(self, source: str, lines, severities) -> None:
-        """Print already split and classified output above the status bar.
-
-        The supervisor splits process output and resolves severities once and
-        feeds the result to the log file, the event stream, and the terminal,
-        so none of that work is repeated per consumer.
-        """
         if not self.output_enabled:
             return
-        self._erase_status()
+        self._ensure_label_cache()
         width = max(self._label_width, len(source))
-        label = f'{source:>{width}}:'
-        if self.enabled:
-            background = self._label_color(source)
-            if background is None:
-                label = '\x1b[38;2;178;178;178m' + label + self.RESET
-            else:
-                red, green, blue = background
-                label = (
-                    f'\x1b[48;2;{red};{green};{blue}m'
-                    '\x1b[38;2;255;255;255m' + label + self.RESET
-                )
-        write = sys.stdout.write
-        for line, line_severity in zip(lines, severities):
+        clean = text.replace('\r\n', '\n').replace('\r', '\n')
+        output = []
+        for line in clean.splitlines():
+            line_severity = self._severity(line, severity, is_stderr)
             if self.warn_only and line_severity not in ('WARNING', 'ERROR', 'FATAL'):
                 continue
+            line = self._message_body(line)
+            label = self._plain_label(source, width)
             if self.enabled:
-                style = SEVERITY_STYLES.get(line_severity)
+                label = self._styled_label(source, width)
+                style = {
+                    'DEBUG': '\x1b[32m',
+                    'WARNING': '\x1b[33m',
+                    'ERROR': '\x1b[31m',
+                    'FATAL': '\x1b[1;31m',
+                }.get(line_severity, '')
                 if style:
                     line = style + line + self.RESET
-            write(f'{label} {line}\n')
-        sys.stdout.flush()
-        self.redraw()
+            output.append(f'{label} {line}\n')
+        if output:
+            self._queue_output(output)
 
     def notice(self, text: str, error: bool = False) -> None:
         self.log('rosmon2', text, severity='ERROR' if error else 'INFO')
 
+    def flush(self) -> None:
+        """Immediately write pending process output."""
+        if self._output_timer is not None:
+            self._output_timer.cancel()
+            self._output_timer = None
+        had_output = bool(self._output_buffer)
+        self._flush_output()
+        if not had_output:
+            sys.stdout.flush()
+
     @staticmethod
     def _severity(line: str, explicit: Optional[str], is_stderr: bool) -> str:
         """Determine severity without assuming all ROS stderr output is an error."""
-        # Stripping ANSI codes allocates a copy of every line, so only pay for
-        # it when the line actually carries an escape sequence.
-        match = SEVERITY_RE.search(ANSI_RE.sub('', line) if '\x1b' in line else line)
+        match = SEVERITY_RE.search(ANSI_RE.sub('', line))
         value = match.group(1) if match else explicit
         if value == 'WARN':
             value = 'WARNING'
@@ -299,16 +313,127 @@ class TerminalUI:
             return value.upper()
         return 'ERROR' if is_stderr else 'INFO'
 
+    @staticmethod
+    def _message_body(line: str) -> str:
+        """Keep rosmon's function/logger field while removing severity and time."""
+        plain = ANSI_RE.sub('', line)
+        match = ROS_CONSOLE_PREFIX_RE.match(plain)
+        if match is None:
+            return line
+        return f'[{match.group("context")}]: {match.group("message")}'
+
     def _label_color(self, source: str):
-        """Return a stable foreground/background pair for a process label."""
-        # Framework messages are plain gray, as rosmon's own messages are.
+        """Return the cached color for a process label."""
+        self._ensure_label_cache()
         return self._label_colors.get(source)
 
-    def redraw(self) -> None:
+    def _ensure_label_cache(self) -> None:
+        if self._label_names is None:
+            names = tuple(record.display_name for record in self.records)
+            self._rebuild_label_cache(names)
+
+    def _rebuild_label_cache(self, names) -> None:
+        """Cache widths and colors that only change with the process list."""
+        self._label_names = names
+        self._label_width = max([len(name) for name in names] + [8])
+        self._label_colors = {}
+        process_count = max(1, len(names))
+        for index, name in enumerate(names):
+            if name not in self._label_colors:
+                hue = index * 360.0 / process_count
+                self._label_colors[name] = _hsluv_label_color(hue)
+        self._plain_labels = {}
+        self._styled_labels = {}
+
+    def _plain_label(self, source: str, width: int) -> str:
+        key = (source, width)
+        cached = self._plain_labels.get(key)
+        if cached is None:
+            cached = f'{source:>{width}}:'
+            self._plain_labels[key] = cached
+        return cached
+
+    def _styled_label(self, source: str, width: int) -> str:
+        key = (source, width)
+        cached = self._styled_labels.get(key)
+        if cached is not None:
+            return cached
+        label = self._plain_label(source, width)
+        background = self._label_colors.get(source)
+        if background is None:
+            styled = '\x1b[38;2;178;178;178m' + label + self.RESET
+        else:
+            red, green, blue = background
+            styled = (
+                f'\x1b[48;2;{red};{green};{blue}m'
+                '\x1b[38;2;255;255;255m' + label + self.RESET
+            )
+        self._styled_labels[key] = styled
+        return styled
+
+    def _queue_output(self, output) -> None:
+        self._output_buffer.extend(output)
+        self._output_buffer_size += sum(len(item) for item in output)
+        if self._loop is None or self._output_buffer_size >= self.OUTPUT_BUFFER_LIMIT:
+            if self._output_timer is not None:
+                self._output_timer.cancel()
+                self._output_timer = None
+            self._flush_output()
+        elif self._output_timer is None:
+            self._output_timer = self._loop.call_later(
+                self.OUTPUT_FLUSH_INTERVAL, self._run_output_flush)
+
+    def _run_output_flush(self) -> None:
+        self._output_timer = None
+        self._flush_output()
+
+    def _flush_output(self, *, redraw: bool = True) -> None:
+        if not self._output_buffer:
+            return
+        output = ''.join(self._output_buffer)
+        self._output_buffer.clear()
+        self._output_buffer_size = 0
+        if (redraw and self.enabled and self._started
+                and self._render_cache_lines is not None):
+            # Keep the status bar in the same terminal write as the new logs.
+            # Writing the erase sequence, logs, and status separately makes
+            # the status area visibly flash while output is streaming.
+            if self._redraw_timer is not None:
+                self._redraw_timer.cancel()
+                self._redraw_timer = None
+            erase = self._take_status_erase()
+            lines = self._render_cache_lines
+            sys.stdout.write(erase + output + self._status_text(lines))
+            self._status_lines = len(lines)
+            self._last_redraw_at = time.monotonic()
+            sys.stdout.flush()
+            return
+
+        self._erase_status()
+        sys.stdout.write(output)
+        redrawn = self._request_redraw() if redraw else False
+        if not redrawn:
+            sys.stdout.flush()
+
+    def redraw(self, *, prefix: str = '') -> None:
+        if self._redraw_timer is not None:
+            self._redraw_timer.cancel()
+            self._redraw_timer = None
         if not self.enabled or not self._started:
             return
-        self._erase_status()
-        columns = max(40, shutil.get_terminal_size((100, 24)).columns)
+        # Keep erasing the previous status and drawing its replacement in one
+        # terminal write.  Selection keys redraw immediately; sending ESC[J
+        # first can otherwise leave a visible blank frame in some terminals.
+        erase = prefix + self._take_status_erase()
+        # Never write into the terminal's final column.  VTE-based terminals
+        # such as Terminator mark that cell for an automatic wrap; the
+        # following newline can then make one logical footer row occupy two
+        # physical rows and invalidate our cursor-up count after a resize.
+        columns = max(4, shutil.get_terminal_size((100, 24)).columns - 1)
+        render_key = self._status_render_key(columns)
+        if self._render_cache_key == render_key:
+            self._draw_status_lines(self._render_cache_lines, prefix=erase)
+            return
         sep = '\x1b[38;2;0;64;64m' + ('▂' * columns) + self.RESET
         showing_namespaces = self.namespace_mode and self.namespace_inspect is None
         if self.search_active:
@@ -378,10 +503,6 @@ class TerminalUI:
 
         blocks = []
         line = ''
-        # Track the visible width as blocks are appended.  Re-measuring the
-        # accumulated line with _visible_len() made every redraw quadratic in
-        # the number of processes, and a redraw happens for every output line.
-        line_width = 0
         for index, (display_name, state_style, muted) in enumerate(entries):
             if self.search_active:
                 name = display_name.lstrip('/')
@@ -392,12 +513,11 @@ class TerminalUI:
                 style = self.SEARCH_SELECTED if self.search_selected == index else ''
                 block = style + label + self.RESET
                 plain_len = len(label)
-                if line_width + plain_len + 1 > columns and line:
+                if self._visible_len(line) + plain_len + 1 > columns and line:
                     blocks.append(line)
-                    line, line_width = block, plain_len
+                    line = block
                 else:
                     line += (' ' if line else '') + block
-                    line_width += plain_len + (1 if line_width else 0)
                 continue
 
             key = selection_key(index)
@@ -418,12 +538,11 @@ class TerminalUI:
             )
             block = key_style + key_text + label_style + label + self.RESET
             plain_len = 1 + len(label)
-            if line_width + plain_len + 1 > columns and line:
+            if self._visible_len(line) + plain_len + 1 > columns and line:
                 blocks.append(line)
-                line, line_width = block, plain_len
+                line = block
             else:
                 line += (' ' if line else '') + block
-                line_width += plain_len + (1 if line_width else 0)
         if line:
             blocks.append(line)
         if not blocks:
@@ -431,18 +550,88 @@ class TerminalUI:
             blocks = [self.IDLE + message + self.RESET]
 
         lines = [sep, menu] + blocks
-        sys.stdout.write('\n'.join(lines) + '\n')
-        sys.stdout.write(f'\x1b[{len(lines)}A\r')
+        self._render_cache_key = render_key
+        self._render_cache_lines = tuple(lines)
+        self._draw_status_lines(lines, prefix=erase)
+
+    def _request_redraw(self) -> bool:
+        """Coalesce log-driven status updates to avoid redrawing per message."""
+        if not self.enabled or not self._started:
+            return False
+        if self._loop is None:
+            self.redraw()
+            return True
+        elapsed = time.monotonic() - self._last_redraw_at
+        delay = self.REDRAW_INTERVAL - elapsed
+        if delay <= 0:
+            self.redraw()
+            return True
+        elif self._redraw_timer is None:
+            self._redraw_timer = self._loop.call_later(
+                delay, self._run_scheduled_redraw)
+        return False
+
+    def _run_scheduled_redraw(self) -> None:
+        self._redraw_timer = None
+        self.redraw()
+
+    def _schedule_resize_redraw(self) -> None:
+        """Recover the footer after terminal reflow settles."""
+        if self._loop is None or not self._started:
+            return
+        if self._resize_timer is not None:
+            self._resize_timer.cancel()
+        self._resize_timer = self._loop.call_later(
+            self.RESIZE_REDRAW_DELAY, self._redraw_after_resize)
+
+    def _redraw_after_resize(self) -> None:
+        self._resize_timer = None
+        if not self.enabled or not self._started:
+            return
+        # Once resize events settle, erase and rebuild only the footer at its
+        # existing origin.  The log area and terminal scrollback stay intact.
+        self.redraw()
+
+    def _status_render_key(self, columns: int):
+        records = tuple(
+            (record.display_name, record.state, record.muted)
+            for record in self.records
+        )
+        return (
+            columns,
+            records,
+            self.selected,
+            self.namespace_mode,
+            self.namespace_inspect,
+            self.search_active,
+            self.search_query,
+            self.search_selected,
+            self.warn_only,
+        )
+
+    def _draw_status_lines(self, lines, *, prefix: str = '') -> None:
+        sys.stdout.write(prefix + self._status_text(lines))
         sys.stdout.flush()
         self._status_lines = len(lines)
+        self._last_redraw_at = time.monotonic()
+
+    @staticmethod
+    def _status_text(lines) -> str:
+        return '\n'.join(lines) + '\n' + f'\x1b[{len(lines)}A\r'
 
     def _menu_item(self, key: str, label: str) -> str:
         return f'{self.BAR_KEY} {key}:{self.BAR} {label} {self.RESET}'
 
     def _erase_status(self) -> None:
+        erase = self._take_status_erase()
+        if erase:
+            sys.stdout.write(erase)
+
+    def _take_status_erase(self) -> str:
         if self.enabled and self._status_lines:
-            sys.stdout.write('\r\x1b[J')
             self._status_lines = 0
+            return '\r\x1b[J'
+        return ''
 
     def _read_input(self) -> None:
         try:
@@ -453,9 +642,15 @@ class TerminalUI:
             self._escape_timer.cancel()
             self._escape_timer = None
         self._buffer += data
+        keys = {
+            '\x1b[15~': 'F5', '\x1b[17~': 'F6', '\x1b[18~': 'F7', '\x1b[19~': 'F8',
+            '\x1b[20~': 'F9', '\x1b[21~': 'F10',
+            '\x1b[A': 'UP', '\x1b[B': 'DOWN',
+            '\x1b[C': 'RIGHT', '\x1b[D': 'LEFT',
+        }
         while self._buffer:
             matched = False
-            for sequence, name in KEY_SEQUENCES.items():
+            for sequence, name in keys.items():
                 if self._buffer.startswith(sequence):
                     self._buffer = self._buffer[len(sequence):]
                     self.on_key(name)
@@ -472,7 +667,7 @@ class TerminalUI:
             # A read can end part-way through a function key.  Wait for the
             # rest instead of emitting the fragment as individual keystrokes;
             # F5-F10 are five bytes, so a fixed length check is not enough.
-            if any(sequence.startswith(self._buffer) for sequence in KEY_SEQUENCES):
+            if any(sequence.startswith(self._buffer) for sequence in keys):
                 break
             char, self._buffer = self._buffer[0], self._buffer[1:]
             self.on_key(char)
